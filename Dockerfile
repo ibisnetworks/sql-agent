@@ -1,49 +1,37 @@
-FROM debian:jessie-slim
+# Base build image
+FROM golang:1.12-alpine AS build_base
 
-ENV LD_LIBRARY_PATH /usr/lib/instantclient_12_1
-ENV ORACLE_HOME /usr/lib/instantclient_12_1
+# Install some dependencies needed to build the project
+RUN apk update && apk add git
+WORKDIR /go/src/github.com/ibisnetworks/sql-agent
 
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends \
-      libaio1 \
-      g++ \
-      gcc \
-      libc6-dev \
-      make \
-      pkg-config \
-      ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Force the go compiler to use modules
+ENV GO111MODULE=on
 
-COPY ./lib/oracle/instantclient_12_1 /usr/lib/instantclient_12_1
-COPY ./lib/oracle/oci8.pc /usr/lib/pkgconfig/
-RUN ln -s /usr/lib/instantclient_12_1/libclntsh.so.12.1 /usr/lib/instantclient_12_1/libclntsh.so
-RUN ln -s /usr/lib/instantclient_12_1/libocci.so.12.1 /usr/lib/instantclient_12_1/libocci.so
+# We want to populate the module cache based on the go.{mod,sum} files.
+COPY go.mod .
 
-COPY ./lib/unixODBC-2.3.1.tar.gz /opt/
-RUN cd /opt && \
-  tar xf unixODBC-2.3.1.tar.gz && \
-  cd /opt/unixODBC-2.3.1 && \
-  ./configure --disable-gui && \
-  make && \
-  make install && \
-  echo '/usr/local/lib' >> /etc/ld.so.conf.d/x86_64-linux-gnu.conf && \
-  ldconfig && \
-  rm -rf /opt/unixODBC-2.3.1*
+# This is the ‘magic’ step that will download all the dependencies that are
+# specified in the go.mod and go.sum file.
+# Because of how the layer caching system works in Docker, the  go mod download
+# command will _ only_ be re-run when the go.mod or go.sum file change
+# (or when we add another docker instruction this line)
+RUN go mod download
 
-# Install Netezza ODBC driver
-COPY ./lib/netezza /opt/netezza/
-RUN /opt/netezza/unpack -f /usr/local/nz && \
-  odbcinst -i -d -f /opt/netezza/netezza.driver && \
-  echo '/usr/local/nz/lib' >> /etc/ld.so.conf.d/x86_64-linux-gnu.conf && \
-  echo '/usr/local/nz/lib64' >> /etc/ld.so.conf.d/x86_64-linux-gnu.conf && \
-  ldconfig && \
-  rm -rf /opt/netezza && \
-  ln -s /usr/local/nz/bin64/nzodbcsql /usr/local/bin/nzodbcsql
+# Here we copy the rest of the source code
+COPY . .
 
-RUN apt-get remove -y aptitude g++ libc6-dev gcc && \
-  apt-get -y autoremove && apt-get clean && \
-  rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# And compile the project
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+RUN go build -o sql-agent ./cmd/sql-agent
 
-COPY ./dist/linux-amd64/sql-agent /usr/bin/sql-agent
+# # In this last stage, we start from an image, to reduce the image size and not
+# # ship the Go compiler in our production artifacts.
+# # FROM scratch
+FROM alpine
 
-CMD ["sql-agent", "-host", "0.0.0.0"]
+# Finally we copy the statically compiled Go binary.
+COPY --from=build_base /go/src/github.com/ibisnetworks/sql-agent/sql-agent /usr/bin/sql-agent
+
+CMD ["sql-agent", "-host", "0.0.0.0"] 
