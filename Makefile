@@ -1,81 +1,58 @@
-IMAGE_NAME := dbhi/sql-agent
-PROG_NAME := sql-agent
+REPONAME := monitoring
+APPNAME := sql-agent
 
-GIT_SHA := $(or $(shell git log -1 --pretty=format:"%h"), "latest")
-GIT_TAG := $(shell git describe --tags --exact-match 2>/dev/null)
-GIT_BRANCH := $(shell git symbolic-ref -q --short HEAD)
+# If TAG is passed in, use that.  Otherwise, default to latest
+TAG := $(if $(TAG),$(TAG),latest)
+STAGE := $(if ${STAGE},${STAGE},staging)
 
-build:
-	go build \
-		-o $(GOPATH)/bin/sql-agent \
-		./cmd/sql-agent
+# Retrieve current git branch and latest commit SHA.
+BRANCH := $(shell git symbolic-ref HEAD | sed -e 's,.*/\(.*\),\1,')
+SHORTSHA := $(shell git log --pretty=format:'%h' -n 1)
+# If there are uncommitted changes, add "-dirty" to the tag.
+DIRTY := $(if $(shell git status --porcelain --untracked-files=no),-dirty,)
 
-clean:
-	go clean ./...
+include ~/.ibis/${STAGE}.env
 
-doc:
-	godoc -http=:6060
+## image: Build the Docker image
+.PHONY: image
+image:
+	docker build --rm . -t '${REPONAME}/$(APPNAME):latest'
+	docker tag ${REPONAME}/$(APPNAME):latest ${REPONAME}/$(APPNAME):$(TAG)
+	docker tag ${REPONAME}/$(APPNAME):latest ${REPONAME}/$(APPNAME):$(BRANCH)
+	docker tag ${REPONAME}/$(APPNAME):latest ${REPONAME}/$(APPNAME):$(BRANCH)-$(SHORTSHA)$(DIRTY)
 
-install:
-	go get github.com/jmoiron/sqlx
+.PHONY: tag
+tag:
+	docker tag ${REPONAME}/$(APPNAME):latest ${REPONAME}/$(APPNAME):$(TAG)
 
-dist:
-	rm -f .dockerignore
-	ln -s .dockerignore.build .dockerignore
-	docker build -f Dockerfile.build -t dbhi/sql-agent-builder .
-	docker run --rm -it \
-		-v ${PWD}/dist/linux-amd64:/go/src/app/dist/linux-amd64 \
-		dbhi/sql-agent-builder
+CMD := $(shell aws ecr get-login --region us-west-2 --no-include-email)
+## registry-login: Log in to Amazon Cloud
+.PHONY: registry-login
+registry-login:
+	@eval $(CMD)
 
-test-install: install
-	go get golang.org/x/tools/cmd/cover
-	go get github.com/mattn/goveralls
-	go get github.com/lib/pq
-	go get github.com/denisenkom/go-mssqldb
-	go get github.com/go-sql-driver/mysql
-	go get github.com/mattn/go-sqlite3
-	go get github.com/mattn/go-oci8
-	go get github.com/alexbrainman/odbc
+## push-image: Push the image to Amazon ECR
+.PHONY: push-image
+push-image: image registry-login
+	docker tag ${REPONAME}/$(APPNAME):$(TAG) \
+		${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(TAG)
+	docker push ${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(TAG)
 
-docker:
-	rm -f .dockerignore
-	ln -s .dockerignore.dist .dockerignore
+	docker tag ${REPONAME}/$(APPNAME):$(BRANCH) \
+		${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(BRANCH)
+	docker push ${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(BRANCH)
 
-	docker build -t ${IMAGE_NAME}:${GIT_SHA} .
+	docker tag ${REPONAME}/$(APPNAME):$(BRANCH)-$(SHORTSHA)$(DIRTY) \
+		${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(BRANCH)-$(SHORTSHA)$(DIRTY)
+	docker push ${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):$(BRANCH)-$(SHORTSHA)$(DIRTY)
 
-	docker tag ${IMAGE_NAME}:${GIT_SHA} ${IMAGE_NAME}:${GIT_BRANCH}
+	docker tag ${REPONAME}/$(APPNAME):latest \
+		${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):latest
+	docker push ${AWS_ECR_BASE_ADDRESS}/${REPONAME}/$(APPNAME):latest
 
-	if [ -n "${GIT_TAG}" ] ; then \
-		docker tag ${IMAGE_NAME}:${GIT_SHA} ${IMAGE_NAME}:${GIT_TAG} ; \
-  fi;
 
-	if [ "${GIT_BRANCH}" == "master" ]; then \
-		docker tag ${IMAGE_NAME}:${GIT_SHA} ${IMAGE_NAME}:latest ; \
-	fi;
-
-test-travis:
-	./test-cover.sh
-
-bench:
-	go test -run=none -bench=. -benchmem ./...
-
-docker-push:
-	docker push ${IMAGE_NAME}:${GIT_SHA}
-	docker push ${IMAGE_NAME}:${GIT_BRANCH}
-
-	if [ -n "${GIT_TAG}" ]; then \
-		docker push ${IMAGE_NAME}:${GIT_TAG} ; \
-  fi;
-
-	if [ "${GIT_BRANCH}" == "master" ]; then \
-		docker push ${IMAGE_NAME}:latest ; \
-	fi;
-
-fmt:
-	go vet ./...
-	go fmt ./...
-
-lint:
-	golint ./...
-
-.PHONY: build dist
+## targets: Show available targets
+.PHONY: help targets
+help targets:
+	@echo "Available targets:"
+	@fgrep -h "##" $(MAKEFILE_LIST) | fgrep -v fgrep | sed -e 's/\\$$//' | sed -e 's/##/   /' | sort
